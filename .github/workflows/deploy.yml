@@ -1,0 +1,70 @@
+name: Deploy and Scan
+
+# Builds the app, deploys it to the EC2 box over SSH, then runs an OWASP ZAP
+# baseline scan against the live HTTPS URL and uploads the report as a
+# workflow artifact. Requires repo secrets — see PREREQUISITES.md:
+#   SSH_HOST, SSH_PORT, SSH_USER, SSH_PRIVATE_KEY, APP_DIR
+on:
+  push:
+    branches:
+      - fixed_code
+      - fix_code_0
+      - security-fixes
+      - live
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      # Fail fast in CI before we ever touch the server.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            export NVM_DIR="$HOME/.nvm"
+            source "$NVM_DIR/nvm.sh"
+            cd "${{ secrets.APP_DIR }}"
+            git fetch origin
+            git checkout "${{ github.ref_name }}"
+            git pull origin "${{ github.ref_name }}"
+            npm ci
+            npm run build
+            pm2 restart lt-nilavan
+
+  zap-scan:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'https://nilavan-v1.cloudworkspace.fun/'
+          allow_issue_writing: false
+          cmd_options: '-a'
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
