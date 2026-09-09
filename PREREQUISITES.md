@@ -36,6 +36,18 @@ Then add these under Repo Settings → Secrets and variables → Actions:
 - [ ] `SSH_PRIVATE_KEY` = contents of `deploy_key` (the private half, not `deploy_key.pub`)
 - [ ] `APP_DIR` = `/home/deploy/lt-nilavan`
 
+## 4b. Passwordless sudo for `deploy` — required for the `server-evidence` CI job
+The pipeline's `server-evidence` job needs `sudo ufw status verbose` and
+`sudo certbot certificates` over SSH as `deploy`. `deploy` has no password, so
+without this it fails with "sudo: Authentication failed". Scoped to just these
+two read-only commands (not full sudo), run as `ubuntu`:
+```bash
+echo 'deploy ALL=(root) NOPASSWD: /usr/sbin/ufw status verbose, /usr/bin/certbot certificates' | sudo tee /etc/sudoers.d/deploy-readonly
+sudo chmod 440 /etc/sudoers.d/deploy-readonly
+sudo visudo -c   # must print "no syntax errors"
+```
+- [ ] Done — confirm `sudo visudo -c` printed no errors
+
 ## 5. Application secrets (server-side `.env`, never committed)
 Confirmed from `app/api/sendgrid/route.ts` — no `.env.example` exists in the repo:
 - [ ] `SENDGRID_API_KEY` — SendGrid account → Settings → API Keys

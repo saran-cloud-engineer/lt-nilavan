@@ -1,16 +1,17 @@
-name: Deploy and Scan
+name: Deploy, Scan and Verify
 
-# Builds the app, deploys it to the EC2 box over SSH, then runs an OWASP ZAP
-# baseline scan against the live HTTPS URL and uploads the report as a
-# workflow artifact. Requires repo secrets — see PREREQUISITES.md:
+# Single pipeline: build -> deploy over SSH -> ZAP scan -> capture server
+# evidence -> run live vulnerability PoCs. Runs on every push, any branch.
+#
+# Requires repo secrets (see PREREQUISITES.md):
 #   SSH_HOST, SSH_PORT, SSH_USER, SSH_PRIVATE_KEY, APP_DIR
+#
+# NOTE: the "spam-flood" and "HTML-injection" PoC steps send REAL emails
+# through SendGrid. They are gated to workflow_dispatch only (manual "Run
+# workflow" button) so routine pushes don't burn SendGrid quota or spam the
+# verified inbox. Everything else runs on every push automatically.
 on:
   push:
-    branches:
-      - fixed_code
-      - fix_code_0
-      - security-fixes
-      - live
   workflow_dispatch: {}
 
 jobs:
@@ -25,7 +26,8 @@ jobs:
         with:
           node-version: '18'
 
-      # Fail fast in CI before we ever touch the server.
+      # Fail fast in CI before we ever touch the server. This also covers
+      # what a separate "CI build check" job would have done.
       - name: Install dependencies
         run: npm ci
 
@@ -55,16 +57,111 @@ jobs:
     needs: deploy
     runs-on: ubuntu-latest
     steps:
-      - name: OWASP ZAP baseline scan
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: 'https://nilavan-v1.cloudworkspace.fun/'
-          allow_issue_writing: false
-          cmd_options: '-a'
+      # Run ZAP directly via Docker rather than zaproxy/action-baseline: that
+      # action's own internal artifact-upload step fails against the current
+      # Actions backend ("Create Artifact Container failed: the artifact name
+      # zap_scan is not valid") even though the scan itself completes fine.
+      # We reproduce the same scan command and upload the report ourselves
+      # with the modern actions/upload-artifact, which works everywhere else
+      # in this pipeline.
+      - name: Run OWASP ZAP baseline scan
+        run: |
+          touch zap-report.html zap-report.json zap-report.md
+          chmod a+w zap-report.html zap-report.json zap-report.md
+          docker run --rm -v "$(pwd)":/zap/wrk/:rw --network=host \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t https://nilavan-v1.cloudworkspace.fun/ \
+            -J zap-report.json -w zap-report.md -r zap-report.html -a || true
+          # zap-baseline.py exits non-zero when it finds WARN/FAIL alerts by
+          # design (that's the point of the scan) — `|| true` stops that from
+          # being misread as a pipeline failure; the report is what matters.
 
       - name: Upload ZAP report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap-report
-          path: report_html.html
+          path: zap-report.*
+
+  server-evidence:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Capture UFW / PM2 / Nginx / Certbot state over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            mkdir -p ~/ci-evidence
+            sudo ufw status verbose > ~/ci-evidence/ufw-status.txt 2>&1 || true
+            pm2 list > ~/ci-evidence/pm2-list.txt 2>&1 || true
+            cat /etc/nginx/sites-available/lt-nilavan > ~/ci-evidence/nginx-config.txt 2>&1 || true
+            sudo certbot certificates > ~/ci-evidence/ssl-certificate.txt 2>&1 || true
+
+      - name: Fetch evidence files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "ci-evidence/*"
+          target: "./downloaded-evidence"
+          strip_components: 1
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-evidence
+          path: downloaded-evidence/
+
+  live-poc-tests:
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      TARGET: https://nilavan-v1.cloudworkspace.fun
+    steps:
+      - name: Non-destructive checks (.git block, clickjacking headers)
+        run: |
+          {
+            echo "=== .git exposure check ==="
+            curl -s -o /dev/null -w "HTTP %{http_code}\n" "$TARGET/.git/config"
+            echo
+            echo "=== Clickjacking / security headers check ==="
+            curl -sI "$TARGET/" | grep -Ei "x-frame-options|content-security-policy|strict-transport-security|x-content-type-options" || echo "NONE FOUND - vulnerable to clickjacking"
+          } | tee poc-safe-results.txt
+
+      - name: "[MANUAL ONLY] Rate-limit / spam-flood PoC (sends real emails)"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "=== Spam-flood PoC: 10 rapid POSTs to /api/sendgrid ==="
+            for i in $(seq 1 10); do
+              curl -s -o /dev/null -w "request $i -> HTTP %{http_code}\n" -X POST "$TARGET/api/sendgrid" \
+                -H "Content-Type: application/json" \
+                -d '{"name":"ci-poc-test","email":"poc@example.com","phone":"0000000000","message":"CI automated PoC - spam flood test"}'
+            done
+          } | tee -a poc-intrusive-results.txt
+
+      - name: "[MANUAL ONLY] HTML-injection PoC (sends a real email)"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "=== HTML-injection PoC ==="
+            curl -s -X POST "$TARGET/api/sendgrid" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"<a href=\"https://evil.example/login\">Verify your account</a>","email":"poc@example.com","phone":"0000000000","message":"CI automated PoC - HTML injection test"}' \
+              -w "\nHTTP %{http_code}\n"
+          } | tee -a poc-intrusive-results.txt
+
+      - name: Upload PoC results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-poc-results
+          path: poc-*.txt
