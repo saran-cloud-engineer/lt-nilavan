@@ -105,8 +105,8 @@ jobs:
           mkdir -p downloaded-evidence
           SSH="ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
           $SSH "sudo ufw status verbose" > downloaded-evidence/ufw-status.txt 2>&1 || true
-          $SSH "pm2 list" > downloaded-evidence/pm2-list.txt 2>&1 || true
-          $SSH "cat /etc/nginx/sites-available/lt-nilavan" > downloaded-evidence/nginx-config.txt 2>&1 || true
+          $SSH 'export NVM_DIR="$HOME/.nvm"; source "$NVM_DIR/nvm.sh"; pm2 list' > downloaded-evidence/pm2-list.txt 2>&1 || true
+          $SSH "cat /etc/nginx/sites-available/lt-nilavan.conf" > downloaded-evidence/nginx-config.txt 2>&1 || true
           $SSH "sudo certbot certificates" > downloaded-evidence/ssl-certificate.txt 2>&1 || true
 
       - name: Upload evidence artifact
