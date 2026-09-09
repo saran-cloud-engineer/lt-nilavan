@@ -87,31 +87,27 @@ jobs:
     needs: deploy
     runs-on: ubuntu-latest
     steps:
-      - name: Capture UFW / PM2 / Nginx / Certbot state over SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          port: ${{ secrets.SSH_PORT }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            mkdir -p ~/ci-evidence
-            sudo ufw status verbose > ~/ci-evidence/ufw-status.txt 2>&1 || true
-            pm2 list > ~/ci-evidence/pm2-list.txt 2>&1 || true
-            cat /etc/nginx/sites-available/lt-nilavan > ~/ci-evidence/nginx-config.txt 2>&1 || true
-            sudo certbot certificates > ~/ci-evidence/ssl-certificate.txt 2>&1 || true
+      # appleboy/ssh-action's `script:` output is captured for logging, not
+      # saved to files we can upload — and appleboy/scp-action copies runner
+      # -> server (the wrong direction; there's nothing to fetch from the
+      # runner's own filesystem, which is why it failed with "tar: empty
+      # archive"). Simplest fix: set up plain ssh ourselves and redirect each
+      # remote command's stdout straight into a local file on the runner.
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Fetch evidence files
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          port: ${{ secrets.SSH_PORT }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "ci-evidence/*"
-          target: "./downloaded-evidence"
-          strip_components: 1
+      - name: Capture UFW / PM2 / Nginx / Certbot state over SSH
+        run: |
+          mkdir -p downloaded-evidence
+          SSH="ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          $SSH "sudo ufw status verbose" > downloaded-evidence/ufw-status.txt 2>&1 || true
+          $SSH "pm2 list" > downloaded-evidence/pm2-list.txt 2>&1 || true
+          $SSH "cat /etc/nginx/sites-available/lt-nilavan" > downloaded-evidence/nginx-config.txt 2>&1 || true
+          $SSH "sudo certbot certificates" > downloaded-evidence/ssl-certificate.txt 2>&1 || true
 
       - name: Upload evidence artifact
         if: always()
