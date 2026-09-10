@@ -14,6 +14,13 @@ on:
   push:
   workflow_dispatch: {}
 
+# Only one run touches the (single, tiny) EC2 box at a time. A new run
+# cancels an in-progress one rather than racing it — running two
+# `npm ci`/`npm run build` at once on a t2/t3.micro thrashes it into swap.
+concurrency:
+  group: deploy-to-ec2
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
