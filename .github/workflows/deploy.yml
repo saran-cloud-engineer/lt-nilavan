@@ -1,0 +1,163 @@
+name: Deploy, Scan and Verify
+
+# Single pipeline: build -> deploy over SSH -> ZAP scan -> capture server
+# evidence -> run live vulnerability PoCs. Runs on every push, any branch.
+#
+# Requires repo secrets (see PREREQUISITES.md):
+#   SSH_HOST, SSH_PORT, SSH_USER, SSH_PRIVATE_KEY, APP_DIR
+#
+# NOTE: the "spam-flood" and "HTML-injection" PoC steps send REAL emails
+# through SendGrid. They are gated to workflow_dispatch only (manual "Run
+# workflow" button) so routine pushes don't burn SendGrid quota or spam the
+# verified inbox. Everything else runs on every push automatically.
+on:
+  push:
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      # Fail fast in CI before we ever touch the server. This also covers
+      # what a separate "CI build check" job would have done.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            export NVM_DIR="$HOME/.nvm"
+            source "$NVM_DIR/nvm.sh"
+            cd "${{ secrets.APP_DIR }}"
+            git fetch origin
+            git checkout "${{ github.ref_name }}"
+            git pull origin "${{ github.ref_name }}"
+            npm ci
+            npm run build
+            pm2 restart lt-nilavan
+
+  zap-scan:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      # Run ZAP directly via Docker rather than zaproxy/action-baseline: that
+      # action's own internal artifact-upload step fails against the current
+      # Actions backend ("Create Artifact Container failed: the artifact name
+      # zap_scan is not valid") even though the scan itself completes fine.
+      # We reproduce the same scan command and upload the report ourselves
+      # with the modern actions/upload-artifact, which works everywhere else
+      # in this pipeline.
+      - name: Run OWASP ZAP baseline scan
+        run: |
+          touch zap-report.html zap-report.json zap-report.md
+          chmod a+w zap-report.html zap-report.json zap-report.md
+          docker run --rm -v "$(pwd)":/zap/wrk/:rw --network=host \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t https://nilavan-v1.cloudworkspace.fun/ \
+            -J zap-report.json -w zap-report.md -r zap-report.html -a || true
+          # zap-baseline.py exits non-zero when it finds WARN/FAIL alerts by
+          # design (that's the point of the scan) — `|| true` stops that from
+          # being misread as a pipeline failure; the report is what matters.
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.*
+
+  server-evidence:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      # appleboy/ssh-action's `script:` output is captured for logging, not
+      # saved to files we can upload — and appleboy/scp-action copies runner
+      # -> server (the wrong direction; there's nothing to fetch from the
+      # runner's own filesystem, which is why it failed with "tar: empty
+      # archive"). Simplest fix: set up plain ssh ourselves and redirect each
+      # remote command's stdout straight into a local file on the runner.
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Capture UFW / PM2 / Nginx / Certbot state over SSH
+        run: |
+          mkdir -p downloaded-evidence
+          SSH="ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          $SSH "sudo ufw status verbose" > downloaded-evidence/ufw-status.txt 2>&1 || true
+          $SSH 'export NVM_DIR="$HOME/.nvm"; source "$NVM_DIR/nvm.sh"; pm2 list' > downloaded-evidence/pm2-list.txt 2>&1 || true
+          $SSH "cat /etc/nginx/sites-available/lt-nilavan.conf" > downloaded-evidence/nginx-config.txt 2>&1 || true
+          $SSH "sudo certbot certificates" > downloaded-evidence/ssl-certificate.txt 2>&1 || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-evidence
+          path: downloaded-evidence/
+
+  live-poc-tests:
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      TARGET: https://nilavan-v1.cloudworkspace.fun
+    steps:
+      - name: Non-destructive checks (.git block, clickjacking headers)
+        run: |
+          {
+            echo "=== .git exposure check ==="
+            curl -s -o /dev/null -w "HTTP %{http_code}\n" "$TARGET/.git/config"
+            echo
+            echo "=== Clickjacking / security headers check ==="
+            curl -sI "$TARGET/" | grep -Ei "x-frame-options|content-security-policy|strict-transport-security|x-content-type-options" || echo "NONE FOUND - vulnerable to clickjacking"
+          } | tee poc-safe-results.txt
+
+      - name: "[MANUAL ONLY] Rate-limit / spam-flood PoC (sends real emails)"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "=== Spam-flood PoC: 10 rapid POSTs to /api/sendgrid ==="
+            for i in $(seq 1 10); do
+              curl -s -o /dev/null -w "request $i -> HTTP %{http_code}\n" -X POST "$TARGET/api/sendgrid" \
+                -H "Content-Type: application/json" \
+                -d '{"name":"ci-poc-test","email":"poc@example.com","phone":"0000000000","message":"CI automated PoC - spam flood test"}'
+            done
+          } | tee -a poc-intrusive-results.txt
+
+      - name: "[MANUAL ONLY] HTML-injection PoC (sends a real email)"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "=== HTML-injection PoC ==="
+            curl -s -X POST "$TARGET/api/sendgrid" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"<a href=\"https://evil.example/login\">Verify your account</a>","email":"poc@example.com","phone":"0000000000","message":"CI automated PoC - HTML injection test"}' \
+              -w "\nHTTP %{http_code}\n"
+          } | tee -a poc-intrusive-results.txt
+
+      - name: Upload PoC results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-poc-results
+          path: poc-*.txt
