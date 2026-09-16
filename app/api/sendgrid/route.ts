@@ -1,6 +1,15 @@
 import { NextResponse } from 'next/server';
 import sendgrid from '@sendgrid/mail';
 
+function escapeHtml(value: string): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -36,10 +45,10 @@ export async function POST(req: Request) {
               <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;" />
               <div style="font-size: 16px; color: #222; margin-bottom: 24px;">
                 <p style="margin: 0 0 16px 0;">You have a new contact form submission:</p>
-                <p style="margin: 0 0 8px 0;"><strong>Name:</strong> ${name}</p>
-                <p style="margin: 0 0 8px 0;"><strong>Email:</strong> ${email}</p>
-                <p style="margin: 0 0 8px 0;"><strong>Phone:</strong> ${phone}</p>
-                <p style="margin: 0 0 8px 0;"><strong>Message:</strong> ${message}</p>
+                <p style="margin: 0 0 8px 0;"><strong>Name:</strong> ${escapeHtml(name)}</p>
+                <p style="margin: 0 0 8px 0;"><strong>Email:</strong> ${escapeHtml(email)}</p>
+                <p style="margin: 0 0 8px 0;"><strong>Phone:</strong> ${escapeHtml(phone)}</p>
+                <p style="margin: 0 0 8px 0;"><strong>Message:</strong> ${escapeHtml(message)}</p>
               </div>
             </div>
           </body>
