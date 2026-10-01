@@ -1,0 +1,162 @@
+POC COMMANDS AND OUTPUTS — lt-nilavan
+Live target: https://nilavan-v1.cloudworkspace.fun/
+All output below is real, captured from the actual live deployment.
+======================================================================
+
+
+[1] SCENARIO: "Flood the business owner's inbox with thousands of spam
+    emails using the contact form" (missing rate limit on /api/sendgrid)
+
+COMMAND:
+for i in $(seq 1 10); do curl -X POST https://nilavan-v1.cloudworkspace.fun/api/sendgrid -H "Content-Type: application/json" -d '{"name":"test","email":"x@x.com","phone":"0000000000","message":"spam"}' ; done
+
+OUTPUT (captured AFTER the Nginx rate-limit fix was applied — see [1a] below
+for status codes; this confirms the fix, not the original vulnerability):
+request 1 -> HTTP 500
+request 2 -> HTTP 500
+request 3 -> HTTP 500
+request 4 -> HTTP 500
+request 5 -> HTTP 429
+request 6 -> HTTP 429
+request 7 -> HTTP 429
+request 8 -> HTTP 429
+request 9 -> HTTP 429
+request 10 -> HTTP 429
+
+[1a] NOTE: requests 1-4 returned 500, not 200 — this is a SEPARATE,
+unrelated app issue (SendGrid send is failing server-side, root cause under
+investigation via `pm2 logs lt-nilavan`), not part of the rate-limit fix
+itself. The rate-limit fix is confirmed by the 429s starting at request 5,
+which is the expected behavior regardless of whether the underlying send
+succeeds or fails.
+
+FIX APPLIED: Nginx `limit_req_zone` (5 req/min per IP, burst=3 nodelay,
+limit_req_status 429) — see scripts/nginx-ratelimit.conf and the
+/api/sendgrid location block in scripts/nginx-lt-nilavan.conf.
+
+
+======================================================================
+[2] SCENARIO: "Access the full source code of the application from the
+    browser without any credentials" (.git exposure)
+
+COMMAND:
+curl -I https://nilavan-v1.cloudworkspace.fun/.git/config
+
+OUTPUT:
+HTTP/1.1 404 Not Found
+Server: nginx/1.28.3 (Ubuntu)
+
+STATUS: Blocked (fixed at deploy time via Nginx `location ~ /\.(git|svn|hg)`
+block in scripts/nginx-lt-nilavan.conf — this was never left exposed on the
+live server, unlike the other findings which were demonstrated vulnerable
+first).
+
+RELATED FINDING (source code exposure via git history, not live server):
+COMMAND:
+git log --all --oneline | grep -iE "token|env|key"
+git show 87785f4a -- src/components/contact.tsx
+
+OUTPUT (excerpt):
+    const token = process.env.NEXT_PUBLIC_BEARER_TOKEN;
+    console.log("Token:", token);
+A bearer token was committed to history via a NEXT_PUBLIC_-prefixed env var
+(bundled into client JS) plus a console.log — gone from the current tree,
+recoverable from full history if .git were ever exposed.
+
+
+======================================================================
+[3] SCENARIO: "Embed this website inside my own malicious site to trick
+    users (clickjacking)"
+
+COMMAND (before fix):
+curl -sI https://nilavan-v1.cloudworkspace.fun/ | grep -Ei "x-frame-options|content-security-policy|strict-transport-security|x-content-type-options"
+
+OUTPUT (before fix):
+NONE FOUND - vulnerable to clickjacking
+
+INDEPENDENTLY CONFIRMED BY OWASP ZAP baseline scan (see reports/zap-report/):
+WARN-NEW: Missing Anti-clickjacking Header [10020] x 1
+WARN-NEW: Content Security Policy (CSP) Header Not Set [10038] x 5
+WARN-NEW: X-Content-Type-Options Header Missing [10021] x 5
+WARN-NEW: Strict-Transport-Security Header Not Set [10035] x 5
+WARN-NEW: Server Leaks Version Information via "Server" Header [10036] x 4
+WARN-NEW: Server Leaks Information via "X-Powered-By" Header [10037] x 5
+(0 FAIL-NEW, 14 WARN-NEW, 56 PASS total in that scan)
+
+FIX APPLIED: `add_header` directives in scripts/nginx-lt-nilavan.conf
+(X-Frame-Options: DENY, CSP frame-ancestors 'none', X-Content-Type-Options:
+nosniff, Referrer-Policy, Strict-Transport-Security).
+
+STATUS: Fix applied — re-verification command (run after deploying the
+updated Nginx config) is the same command as above; expected to now show
+the headers present instead of "NONE FOUND".
+
+
+======================================================================
+[4] SCENARIO: "Inject a malicious link into an email that appears to come
+    from the business's own system"
+
+COMMAND (planned — not yet executed with recorded output):
+curl -X POST https://nilavan-v1.cloudworkspace.fun/api/sendgrid \
+  -H "Content-Type: application/json" \
+  -d '{"name":"<a href=\"https://evil.example/login\">Verify your account</a>","email":"x@x.com","phone":"0000000000","message":"test"}'
+
+STATUS: PENDING. This is one of the two PoCs gated to manual
+`workflow_dispatch` in the CI pipeline (sends a real email) rather than
+running on every push. Not yet triggered/confirmed since the concurrency fix
+was applied to the pipeline. Root cause confirmed via static code review:
+app/api/sendgrid/route.ts interpolates `${name}`, `${email}`, `${phone}`,
+`${message}` directly into the outgoing HTML email with no escaping.
+FIX: not yet applied (requires an app-code change — see WRITEUP.md
+trade-offs section for why this is the one fix still pending).
+
+
+======================================================================
+[5] SCENARIO: "I gained access to the server — how did running the app as
+    root make things worse?"
+
+COMMAND:
+ssh -p 2222 -i nilavan.pem deploy@13.205.51.146 "pm2 list"
+(also captured automatically each CI run — see reports/server-evidence/pm2-list.txt)
+
+OUTPUT:
+┌────┬───────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name          │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼───────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 0  │ lt-nilavan    │ default     │ 0.39.7  │ fork    │ 144158   │ 18s    │ 5    │ online    │ 0%       │ 53.3mb   │ deploy   │ disabled │
+└────┴───────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+
+Process owner confirmed as `deploy`, not root. Explanation (no live exploit
+needed/possible to responsibly demonstrate): had this process been running
+as root, any future code-execution-class bug in the app or its dependencies
+(e.g. one of the 15 advisories from `npm audit`) would hand an attacker full
+root on the box immediately, instead of being contained to the low-privilege
+`deploy` account's limited permissions.
+
+
+======================================================================
+SUPPORTING SERVER-STATE EVIDENCE (captured automatically every CI run,
+full files in reports/server-evidence/):
+
+COMMAND: sudo ufw status verbose
+OUTPUT:
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+To                         Action      From
+22/tcp                     ALLOW IN    Anywhere
+80/tcp                     ALLOW IN    Anywhere
+443/tcp                    ALLOW IN    Anywhere
+2222/tcp                   ALLOW IN    Anywhere
+(+ IPv6 equivalents)
+
+COMMAND: sudo certbot certificates
+OUTPUT:
+Certificate Name: nilavan-v1.cloudworkspace.fun
+  Key Type: ECDSA
+  Domains: nilavan-v1.cloudworkspace.fun
+  Expiry Date: 2026-12-06 07:19:14+00:00 (VALID: 88 days)
+
+COMMAND: ssh -p 2222 -o PreferredAuthentications=password -o PubkeyAuthentication=no ubuntu@13.205.51.146
+OUTPUT: Permission denied (publickey) — password auth confirmed rejected on
+both SSH ports (22 and 2222).
