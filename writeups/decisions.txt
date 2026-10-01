@@ -1,0 +1,47 @@
+decisions i made
+
+- used multiple feature branches (fixed_code, fix_code_0, fix_code_2,
+  security-fixes) to track each version of the fix code separately,
+  instead of overwriting the same branch each time.
+
+- split ci/cd into two workflows - deploy runs automatically on every
+  push, scan (zap + evidence + poc checks) only runs after deploy
+  finishes, or manually when needed. kept the two intrusive poc tests
+  (spam flood, html injection - both send real emails) as manual-only
+  so they don't run on every push.
+
+- kept port 22 open alongside the new port 2222, instead of closing it
+  like the assessment literally asked. did this on purpose for backup
+  access, since key-only login is enforced the same on both ports
+  anyway. [confirm this is still actually the current state before
+  finalizing]
+
+- used ec2 user data to install all the base binaries automatically on
+  first boot, instead of doing each install step by hand every time.
+
+- added 2gb swap on the server since it only has 1gb ram and npm ci
+  was getting killed without it.
+
+- gave deploy passwordless sudo for only 2-3 exact commands needed by
+  the automation, not full root access.
+
+- also gave deploy temporary sudo access a few times during setup when
+  a one-off command needed root (not part of the regular automation),
+  instead of switching back to the ubuntu user each time.
+
+- made a separate ssh key just for github actions instead of reusing
+  my own admin key.
+
+- rate limit and security headers fixed at the nginx level instead of
+  in the app code, to keep the code changes smaller.
+
+- upgraded next.js enough to fix the one real rce issue, didn't force
+  the last 2 remaining issues since they need a full major version
+  upgrade.
+
+- old leaked secret in git history - left the history as is, just
+  documented it and noted to rotate the key if still active, instead of
+  trying to rewrite published git history.
+
+- after the server got hacked mid-assessment, decided to clean it up
+  and keep using the same instance instead of rebuilding from scratch.

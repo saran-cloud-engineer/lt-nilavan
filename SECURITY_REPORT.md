@@ -102,7 +102,7 @@ live against the deployment.
   curl -X POST https://nilavan-v1.cloudworkspace.fun/api/sendgrid -H "Content-Type: application/json" -d '{"name":"<a href=\"https://evil.example/login\">Verify your account</a>","email":"x@x.com","phone":"0000000000","message":"test"}'
   ```
 - **Before fix**: email rendered a real, clickable "Verify your account" link
-- **Confirmed result (after fix)**: API returns `{"success":true}`; the received email shows the **literal text** `<a href="https://evil.example/login">Verify your account</a>` — not a rendered link (`screenshots/html-injection-fix-confirmed.png`). Gmail auto-links the bare URL substring itself (a client-side behavior, not our app rendering a link), but the actual vulnerability — a malicious link disguised behind trustworthy text — is fully neutralized.
+- **Confirmed result (after fix)**: API returns `{"success":true}`; the received email shows the **literal text** `<a href="https://evil.example/login">Verify your account</a>` — not a rendered link (`screenshots/htlm-injuction-fix.png`). Gmail auto-links the bare URL substring itself (a client-side behavior, not our app rendering a link), but the actual vulnerability — a malicious link disguised behind trustworthy text — is fully neutralized.
 
 ---
 

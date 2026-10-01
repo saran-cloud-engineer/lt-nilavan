@@ -1,0 +1,32 @@
+tradeoffs
+
+- rate limit and security headers fixed in nginx config instead of app
+  code. faster to apply, no app rebuild needed - but the security logic
+  now lives outside the actual codebase, so someone reading just the
+  code wouldn't see these protections exist.
+
+- rate limit is in-memory, per server, not a shared store like redis.
+  simple and needs no extra infra, but won't work correctly if this
+  ever runs on more than one server, and it's based on client ip which
+  can be bypassed by sending from multiple ips. fine for this single
+  small server, not production-grade on its own.
+
+- kept port 22 open alongside the new port 2222 instead of closing it.
+  gives a backup way in if something goes wrong with the new port, but
+  technically leaves one more open port than the assessment asked for.
+  (the real protection - key only login - is the same on both ports.)
+
+- upgraded next.js enough to fix the one real rce, didn't force the
+  last 2 remaining audit issues. avoided the risk of a bigger upgrade
+  breaking the app without proper testing, but those 2 lower issues
+  stay unfixed for now.
+
+- didn't rewrite git history to remove the old leaked secret. avoided
+  the risk/mess of rewriting already-pushed history, but the secret is
+  still technically recoverable from old commits if someone really
+  wanted to dig for it (mitigated by rotating the key instead).
+
+- used a swap file instead of a bigger server to fix the low ram issue.
+  stays on the free tier, no extra cost, but builds run slower than
+  they would with real ram - fine for this assessment, not ideal for
+  real production traffic.

@@ -401,3 +401,8 @@ Expect: app `online` with a fresh PID and `0` restarts, site returns `200` — w
 
 ### 8.12 GitHub Actions pipeline
 Actions tab → latest run → all 4 jobs green (`deploy`, `zap-scan`, `server-evidence`, `live-poc-tests`). "Run workflow" button available for manual triggers.
+
+---
+
+**Repository**: https://github.com/saran-cloud-engineer/lt-nilavan
+**Branch with all fixes**: `security-fixes`

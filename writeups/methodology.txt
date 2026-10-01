@@ -1,0 +1,52 @@
+methodology
+
+general approach: don't guess, check the actual thing directly. every
+problem below got solved by looking at real output (logs, files, config)
+instead of assuming what was wrong.
+
+- npm ci kept failing with "killed" and no clear error
+  checked server memory, realised it's an out-of-memory kill not a code
+  problem, added swap, retried, worked.
+
+- pm2 -v gave a permission error (eacces)
+  checked the actual file permissions first instead of assuming it was
+  a real permission bug - they were fine. figured it was corrupted
+  daemon state instead, cleared ~/.pm2 and retried, worked.
+
+- sendgrid kept returning 500 on every request
+  didn't guess, went straight to pm2 logs to see the real error message
+  from sendgrid itself - found the exact reason (sender not verified)
+  in one read.
+
+
+- a step using pm2 over ssh said "command not found" even though pm2 is
+  installed
+  understood why first instead of just retrying - a single ssh command
+  doesn't load the normal shell setup, so it doesn't know where pm2 is.
+  fixed by loading that setup in the same command.
+
+- the manual "run workflow" button wasn't showing up on github
+  checked github's own rule for this instead of guessing - the workflow
+  file has to exist on the default branch. added it there, button
+  showed up.
+
+- npm audit fix --force showed scary text about installing a very old
+  next.js version
+  didn't trust the scary text alone - checked the actual installed
+  version directly in package.json and node_modules afterward, confirmed
+  it was fine, the scary line was just a preview, not a real change.
+
+- rate limit test passed locally but failed when tested from the real
+  public domain (all 10 requests succeeded instead of getting blocked)
+  narrowed it down step by step: checked the config files first (all
+  correct), tested the same request directly on the server itself
+  (worked correctly there), then checked the actual ip addresses nginx
+  logged for the public test - found each request came from a different
+  ip. traced it to the network being used having multiple exit ips,
+  not a bug in the setup.
+
+- noticed something odd in a routine log check (weird folder names,
+  strange error output)
+  didn't ignore it - decoded the odd output directly, checked running
+  processes, checked scheduled jobs, checked who had logged in, before
+  deciding what it actually was.
