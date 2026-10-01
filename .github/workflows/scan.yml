@@ -1,0 +1,116 @@
+name: Scan
+
+# Security scan + evidence capture. Does NOT listen to push at all — it only
+# runs when the Deploy workflow finishes (workflow_run), so a scan never
+# fires on its own, only as a consequence of a successful deploy. Manual
+# "Run workflow" is also available (needed to trigger the 2 PoC steps that
+# send real emails, which never run automatically).
+on:
+  workflow_run:
+    workflows: ["Deploy"]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  zap-scan:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      # Run ZAP directly via Docker rather than zaproxy/action-baseline: that
+      # action's own internal artifact-upload step fails against the current
+      # Actions backend ("Create Artifact Container failed: the artifact name
+      # zap_scan is not valid") even though the scan itself completes fine.
+      - name: Run OWASP ZAP baseline scan
+        run: |
+          touch zap-report.html zap-report.json zap-report.md
+          chmod a+w zap-report.html zap-report.json zap-report.md
+          docker run --rm -v "$(pwd)":/zap/wrk/:rw --network=host \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t https://nilavan-v1.cloudworkspace.fun/ \
+            -J zap-report.json -w zap-report.md -r zap-report.html -a || true
+          # zap-baseline.py exits non-zero when it finds WARN/FAIL alerts by
+          # design — `|| true` stops that from being misread as a pipeline
+          # failure; the report is what matters.
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.*
+
+  server-evidence:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      # Plain ssh + redirect into a file — appleboy/scp-action copies the
+      # wrong direction (runner -> server), and ssh-action's `script:` output
+      # isn't saved to a file we can upload.
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Capture UFW / PM2 / Nginx / Certbot state over SSH
+        run: |
+          mkdir -p downloaded-evidence
+          SSH="ssh -i ~/.ssh/deploy_key -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          $SSH "sudo ufw status verbose" > downloaded-evidence/ufw-status.txt 2>&1 || true
+          $SSH 'export NVM_DIR="$HOME/.nvm"; source "$NVM_DIR/nvm.sh"; pm2 list' > downloaded-evidence/pm2-list.txt 2>&1 || true
+          $SSH "cat /etc/nginx/sites-available/lt-nilavan.conf" > downloaded-evidence/nginx-config.txt 2>&1 || true
+          $SSH "sudo certbot certificates" > downloaded-evidence/ssl-certificate.txt 2>&1 || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-evidence
+          path: downloaded-evidence/
+
+  live-poc-tests:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      TARGET: https://nilavan-v1.cloudworkspace.fun
+    steps:
+      - name: Non-destructive checks (.git block, clickjacking headers)
+        run: |
+          {
+            echo "=== .git exposure check ==="
+            curl -s -o /dev/null -w "HTTP %{http_code}\n" "$TARGET/.git/config"
+            echo
+            echo "=== Clickjacking / security headers check ==="
+            curl -sI "$TARGET/" | grep -Ei "x-frame-options|content-security-policy|strict-transport-security|x-content-type-options" || echo "NONE FOUND - vulnerable to clickjacking"
+          } | tee poc-safe-results.txt
+
+      - name: "[MANUAL ONLY] Rate-limit / spam-flood PoC (sends real emails)"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "=== Spam-flood PoC: 10 rapid POSTs to /api/sendgrid ==="
+            for i in $(seq 1 10); do
+              curl -s -o /dev/null -w "request $i -> HTTP %{http_code}\n" -X POST "$TARGET/api/sendgrid" \
+                -H "Content-Type: application/json" \
+                -d '{"name":"ci-poc-test","email":"poc@example.com","phone":"0000000000","message":"CI automated PoC - spam flood test"}'
+            done
+          } | tee -a poc-intrusive-results.txt
+
+      - name: "[MANUAL ONLY] HTML-injection PoC (sends a real email)"
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "=== HTML-injection PoC ==="
+            curl -s -X POST "$TARGET/api/sendgrid" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"<a href=\"https://evil.example/login\">Verify your account</a>","email":"poc@example.com","phone":"0000000000","message":"CI automated PoC - HTML injection test"}' \
+              -w "\nHTTP %{http_code}\n"
+          } | tee -a poc-intrusive-results.txt
+
+      - name: Upload PoC results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-poc-results
+          path: poc-*.txt
